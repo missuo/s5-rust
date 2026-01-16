@@ -1,0 +1,12 @@
+[package]
+name = "s5-rust"
+version = "0.1.0"
+edition = "2021"
+description = "A SOCKS5 proxy server with username/password authentication"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
