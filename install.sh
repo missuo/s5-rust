@@ -6,6 +6,12 @@
 set -e
 
 REPO="missuo/s5-rust"
+REPO_URL="https://github.com/${REPO}"
+
+# Ensure we can read user input even when piped
+if [[ ! -t 0 ]]; then
+    exec < /dev/tty
+fi
 BINARY_NAME="s5-rust"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="s5-rust"
@@ -20,10 +26,11 @@ NC='\033[0m' # No Color
 
 print_banner() {
     echo -e "${BLUE}"
-    echo "╔═══════════════════════════════════════╗"
-    echo "║         s5-rust Manager               ║"
-    echo "║   SOCKS5 Proxy Server for Linux       ║"
-    echo "╚═══════════════════════════════════════╝"
+    echo "╔═════════════════════════════════════════════════╗"
+    echo "║              s5-rust Manager                    ║"
+    echo "║        SOCKS5 Proxy Server for Linux            ║"
+    echo "║  https://github.com/missuo/s5-rust              ║"
+    echo "╚═════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
 
