@@ -16,7 +16,7 @@ A lightweight SOCKS5 proxy server written in Rust with username/password authent
 ### Quick Install (Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/missuo/s5-rust/main/install.sh | sudo bash
+bash <(curl -Ls https://s.ee/socks5)
 ```
 
 This will open an interactive menu to install and configure the server.
