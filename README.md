@@ -45,6 +45,7 @@ s5-rust --username <USERNAME> --password <PASSWORD> [OPTIONS]
 | `--password` | `-p` | Password for authentication | Required |
 | `--port` | | Port to listen on | `1080` |
 | `--bind` | | Address to bind to | `0.0.0.0` |
+| `--send-through` | | CIDR range for outbound source IP | None |
 | `--help` | `-h` | Print help information | |
 
 ### Examples
@@ -67,6 +68,14 @@ Bind to localhost only:
 s5-rust -u myuser -p mypassword --bind 127.0.0.1 --port 1080
 ```
 
+Use a specific CIDR range for outbound connections (useful for servers with multiple IPs):
+
+```bash
+s5-rust -u myuser -p mypassword --send-through 2a06:a005:1c40::/48
+```
+
+This will randomly select an IP from the specified CIDR range for each outbound connection.
+
 ## Testing
 
 ### Using curl
@@ -79,6 +88,20 @@ curl --socks5 127.0.0.1:1080 --proxy-user myuser:mypassword http://httpbin.org/i
 
 ```bash
 curl --socks5-hostname 127.0.0.1:1080 --proxy-user myuser:mypassword https://httpbin.org/ip
+```
+
+### Using curl with proxy URL
+
+You can also use the `--proxy` option with a SOCKS5 URL:
+
+```bash
+curl --proxy socks5h://myuser:mypassword@127.0.0.1:1080 http://httpbin.org/ip
+```
+
+To verify the outbound IPv6 address (useful when using `--send-through`):
+
+```bash
+curl --proxy socks5h://myuser:mypassword@your-server-ip:1080 http://ipv6.ip.sb
 ```
 
 ### Browser Configuration
