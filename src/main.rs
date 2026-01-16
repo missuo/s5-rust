@@ -1,16 +1,12 @@
 use clap::Parser;
 use ipnet::IpNet;
 use rand::Rng;
-use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tracing::{error, info, warn};
-
-#[cfg(unix)]
-use std::os::unix::io::{FromRawFd, IntoRawFd};
 
 // SOCKS5 protocol constants
 const SOCKS_VERSION: u8 = 0x05;
@@ -342,39 +338,40 @@ async fn handle_request(stream: &mut TcpStream, config: &ServerConfig) -> Result
         let local_ip = random_ip_from_cidr(cidr);
         info!("Connecting to {} via {}", target, local_ip);
 
-        // Resolve target address (handles both IP and domain names)
-        let mut addrs = tokio::net::lookup_host(&target).await?;
-        let remote_addr = match local_ip {
-            IpAddr::V4(_) => addrs.find(|a| a.is_ipv4()),
-            IpAddr::V6(_) => addrs.find(|a| a.is_ipv6()),
-        };
+        // Resolve target address and try to connect
+        match target.to_socket_addrs() {
+            Ok(addrs) => {
+                let mut last_err = None;
+                let mut connected = None;
 
-        match remote_addr {
-            Some(addr) => {
-                let domain = match local_ip {
-                    IpAddr::V4(_) => Domain::IPV4,
-                    IpAddr::V6(_) => Domain::IPV6,
-                };
-                let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+                for addr in addrs {
+                    // Create socket matching the local IP family
+                    let socket = match local_ip {
+                        IpAddr::V4(_) if addr.is_ipv4() => TcpSocket::new_v4()?,
+                        IpAddr::V6(_) if addr.is_ipv6() => TcpSocket::new_v6()?,
+                        _ => continue, // Skip if address family doesn't match
+                    };
 
-                // Enable IP_FREEBIND to bind to addresses not yet configured on the interface
-                #[cfg(target_os = "linux")]
-                socket.set_freebind(true)?;
+                    let bind_addr = SocketAddr::new(local_ip, 0);
+                    if socket.bind(bind_addr).is_ok() {
+                        match socket.connect(addr).await {
+                            Ok(stream) => {
+                                connected = Some(stream);
+                                break;
+                            }
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                }
 
-                socket.bind(&SocketAddr::new(local_ip, 0).into())?;
-                socket.set_nonblocking(true)?;
-
-                // Convert socket2::Socket to tokio::TcpSocket via raw fd
-                #[cfg(unix)]
-                let tcp_socket = unsafe { TcpSocket::from_raw_fd(socket.into_raw_fd()) };
-
-                tcp_socket.connect(addr).await
+                match connected {
+                    Some(stream) => Ok(stream),
+                    None => Err(last_err.unwrap_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "No matching address family")
+                    })),
+                }
             }
-            None => {
-                // Fallback: try to connect without binding if no matching address family
-                warn!("No matching address family for {}, connecting without bind", target);
-                TcpStream::connect(&target).await
-            }
+            Err(e) => Err(e),
         }
     } else {
         info!("Connecting to {}", target);
