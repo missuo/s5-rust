@@ -122,6 +122,12 @@ create_service() {
     local username=$1
     local password=$2
     local port=$3
+    local send_through=$4
+
+    local exec_cmd="${INSTALL_DIR}/${BINARY_NAME} -u ${username} -p ${password} --port ${port}"
+    if [[ -n "$send_through" ]]; then
+        exec_cmd="${exec_cmd} --send-through ${send_through}"
+    fi
 
     cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
 [Unit]
@@ -130,7 +136,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/${BINARY_NAME} -u ${username} -p ${password} --port ${port}
+ExecStart=${exec_cmd}
 Restart=on-failure
 RestartSec=5
 
@@ -146,12 +152,14 @@ save_config() {
     local username=$1
     local password=$2
     local port=$3
+    local send_through=$4
 
     mkdir -p "${CONFIG_DIR}"
     cat > "${CONFIG_FILE}" << EOF
 USERNAME=${username}
 PASSWORD=${password}
 PORT=${port}
+SEND_THROUGH=${send_through}
 EOF
     chmod 600 "${CONFIG_FILE}"
 }
@@ -159,7 +167,7 @@ EOF
 load_config() {
     if [[ -f "${CONFIG_FILE}" ]]; then
         source "${CONFIG_FILE}"
-        echo "$USERNAME $PASSWORD $PORT"
+        echo "$USERNAME $PASSWORD $PORT $SEND_THROUGH"
     fi
 }
 
@@ -203,16 +211,22 @@ install() {
         input_port=1080
     fi
 
+    # Get send-through CIDR (optional)
+    echo ""
+    echo -e "${YELLOW}Send-through allows you to specify an outbound IP range (CIDR).${NC}"
+    echo -e "${YELLOW}Example: 2a06:a005:1c40::/44 or 192.168.1.0/24${NC}"
+    read -p "Enter send-through CIDR (press Enter to skip): " input_send_through
+
     echo ""
 
     # Download binary
     download_binary "$version"
 
     # Save config
-    save_config "$input_username" "$input_password" "$input_port"
+    save_config "$input_username" "$input_password" "$input_port" "$input_send_through"
 
     # Create systemd service
-    create_service "$input_username" "$input_password" "$input_port"
+    create_service "$input_username" "$input_password" "$input_port" "$input_send_through"
 
     # Start service
     systemctl start ${SERVICE_NAME}
@@ -223,9 +237,12 @@ install() {
     echo -e "${GREEN}Installation completed successfully!${NC}"
     echo -e "${GREEN}════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  Server:   0.0.0.0:${input_port}"
-    echo -e "  Username: ${input_username}"
-    echo -e "  Password: ${input_password}"
+    echo -e "  Server:       0.0.0.0:${input_port}"
+    echo -e "  Username:     ${input_username}"
+    echo -e "  Password:     ${input_password}"
+    if [[ -n "$input_send_through" ]]; then
+        echo -e "  Send-through: ${input_send_through}"
+    fi
     echo ""
     echo -e "  Test command:"
     echo -e "  curl --socks5 127.0.0.1:${input_port} --proxy-user ${input_username}:${input_password} http://httpbin.org/ip"
@@ -358,9 +375,12 @@ show_status() {
     if [[ -f "${CONFIG_FILE}" ]]; then
         source "${CONFIG_FILE}"
         echo ""
-        echo -e "  Port:      ${PORT}"
-        echo -e "  Username:  ${USERNAME}"
-        echo -e "  Password:  ${PASSWORD}"
+        echo -e "  Port:        ${PORT}"
+        echo -e "  Username:    ${USERNAME}"
+        echo -e "  Password:    ${PASSWORD}"
+        if [[ -n "$SEND_THROUGH" ]]; then
+            echo -e "  Send-through: ${SEND_THROUGH}"
+        fi
     fi
 }
 
