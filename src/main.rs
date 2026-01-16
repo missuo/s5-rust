@@ -1,9 +1,11 @@
 use clap::Parser;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use ipnet::IpNet;
+use rand::Rng;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tracing::{error, info, warn};
 
 // SOCKS5 protocol constants
@@ -62,6 +64,37 @@ enum Socks5Error {
 struct ServerConfig {
     username: String,
     password: String,
+    send_through: Option<IpNet>,
+}
+
+fn random_ip_from_cidr(cidr: &IpNet) -> IpAddr {
+    let mut rng = rand::thread_rng();
+    match cidr {
+        IpNet::V4(net) => {
+            let network = u32::from(net.network());
+            let host_bits = 32 - net.prefix_len();
+            let host_part: u32 = if host_bits > 0 {
+                rng.gen_range(0..(1u32 << host_bits))
+            } else {
+                0
+            };
+            IpAddr::V4(Ipv4Addr::from(network | host_part))
+        }
+        IpNet::V6(net) => {
+            let network = u128::from(net.network());
+            let host_bits = 128 - net.prefix_len();
+            let host_part: u128 = if host_bits > 0 {
+                if host_bits >= 128 {
+                    rng.gen()
+                } else {
+                    rng.gen::<u128>() & ((1u128 << host_bits) - 1)
+                }
+            } else {
+                0
+            };
+            IpAddr::V6(Ipv6Addr::from(network | host_part))
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -83,6 +116,10 @@ struct Args {
     /// Address to bind to
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
+
+    /// CIDR range for outbound source IP (e.g., 2a06:a005:1c40::/44)
+    #[arg(long)]
+    send_through: Option<String>,
 }
 
 #[tokio::main]
@@ -97,9 +134,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
+    let send_through = args.send_through.map(|s| {
+        s.parse::<IpNet>().expect("Invalid CIDR format for --send-through")
+    });
+
+    if let Some(ref cidr) = send_through {
+        info!("Send through CIDR: {}", cidr);
+    }
+
     let config = Arc::new(ServerConfig {
         username: args.username,
         password: args.password,
+        send_through,
     });
 
     let addr = format!("{}:{}", args.bind, args.port);
@@ -144,7 +190,7 @@ async fn handle_client(
     }
 
     // Step 3: Handle request
-    let target_stream = handle_request(&mut stream).await?;
+    let target_stream = handle_request(&mut stream, &config).await?;
 
     // Step 4: Relay data
     relay_data(stream, target_stream).await?;
@@ -227,7 +273,7 @@ async fn authenticate(stream: &mut TcpStream, config: &ServerConfig) -> Result<(
     }
 }
 
-async fn handle_request(stream: &mut TcpStream) -> Result<TcpStream, Socks5Error> {
+async fn handle_request(stream: &mut TcpStream, config: &ServerConfig) -> Result<TcpStream, Socks5Error> {
     // Read request header
     // +----+-----+-------+------+----------+----------+
     // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
@@ -286,10 +332,40 @@ async fn handle_request(stream: &mut TcpStream) -> Result<TcpStream, Socks5Error
     stream.read_exact(&mut port_buf).await?;
     let port = u16::from_be_bytes(port_buf);
 
-    info!("Connecting to {}:{}", target_addr, port);
-
     // Connect to target
-    match TcpStream::connect(format!("{}:{}", target_addr, port)).await {
+    let target = format!("{}:{}", target_addr, port);
+    let connect_result = if let Some(ref cidr) = config.send_through {
+        let local_ip = random_ip_from_cidr(cidr);
+        info!("Connecting to {} via {}", target, local_ip);
+
+        // Resolve target address (handles both IP and domain names)
+        let mut addrs = tokio::net::lookup_host(&target).await?;
+        let remote_addr = match local_ip {
+            IpAddr::V4(_) => addrs.find(|a| a.is_ipv4()),
+            IpAddr::V6(_) => addrs.find(|a| a.is_ipv6()),
+        };
+
+        match remote_addr {
+            Some(addr) => {
+                let socket = match local_ip {
+                    IpAddr::V4(_) => TcpSocket::new_v4()?,
+                    IpAddr::V6(_) => TcpSocket::new_v6()?,
+                };
+                socket.bind(SocketAddr::new(local_ip, 0))?;
+                socket.connect(addr).await
+            }
+            None => {
+                // Fallback: try to connect without binding if no matching address family
+                warn!("No matching address family for {}, connecting without bind", target);
+                TcpStream::connect(&target).await
+            }
+        }
+    } else {
+        info!("Connecting to {}", target);
+        TcpStream::connect(&target).await
+    };
+
+    match connect_result {
         Ok(target_stream) => {
             let local_addr = target_stream.local_addr().ok();
             send_reply(stream, REPLY_SUCCEEDED, local_addr).await?;
