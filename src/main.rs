@@ -179,18 +179,19 @@ async fn handle_client(
     // Step 1: Handle greeting and authentication negotiation
     let auth_method = negotiate_auth(&mut stream).await?;
 
-    if auth_method == AUTH_USERNAME_PASSWORD {
+    let outbound_ip = if auth_method == AUTH_USERNAME_PASSWORD {
         // Step 2: Perform username/password authentication
-        authenticate(&mut stream, &config).await?;
+        let ip = authenticate(&mut stream, &config).await?;
         info!("Client {} authenticated successfully", peer_addr);
+        ip
     } else {
         // No acceptable method
         stream.write_all(&[SOCKS_VERSION, AUTH_NO_ACCEPTABLE]).await?;
         return Err(Socks5Error::NoAcceptableAuth);
-    }
+    };
 
     // Step 3: Handle request
-    let target_stream = handle_request(&mut stream, &config).await?;
+    let target_stream = handle_request(&mut stream, &config, outbound_ip).await?;
 
     // Step 4: Relay data
     relay_data(stream, target_stream).await?;
@@ -230,7 +231,10 @@ async fn negotiate_auth(stream: &mut TcpStream) -> Result<u8, Socks5Error> {
     Ok(selected_method)
 }
 
-async fn authenticate(stream: &mut TcpStream, config: &ServerConfig) -> Result<(), Socks5Error> {
+async fn authenticate(
+    stream: &mut TcpStream,
+    config: &ServerConfig,
+) -> Result<Option<IpAddr>, Socks5Error> {
     // Read authentication request
     // +----+------+----------+------+----------+
     // |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
@@ -263,17 +267,36 @@ async fn authenticate(stream: &mut TcpStream, config: &ServerConfig) -> Result<(
     stream.read_exact(&mut password).await?;
     let password = String::from_utf8_lossy(&password).to_string();
 
+    // Split on the last '@'. If the right side parses as an IP and falls
+    // within the configured send_through CIDR, the left side is the base
+    // password and the IP is used as the outbound source. Otherwise the
+    // whole string is treated as the password with no IP override.
+    let (base_password, outbound_ip) = match password.rsplit_once('@') {
+        Some((base, ip_str)) => match ip_str.parse::<IpAddr>() {
+            Ok(ip) => match &config.send_through {
+                Some(cidr) if cidr.contains(&ip) => (base.to_string(), Some(ip)),
+                _ => (password.clone(), None),
+            },
+            Err(_) => (password.clone(), None),
+        },
+        None => (password.clone(), None),
+    };
+
     // Verify credentials
-    if username == config.username && password == config.password {
+    if username == config.username && base_password == config.password {
         stream.write_all(&[AUTH_PASSWORD_VERSION, 0x00]).await?;
-        Ok(())
+        Ok(outbound_ip)
     } else {
         stream.write_all(&[AUTH_PASSWORD_VERSION, 0x01]).await?;
         Err(Socks5Error::AuthFailed)
     }
 }
 
-async fn handle_request(stream: &mut TcpStream, config: &ServerConfig) -> Result<TcpStream, Socks5Error> {
+async fn handle_request(
+    stream: &mut TcpStream,
+    config: &ServerConfig,
+    outbound_ip: Option<IpAddr>,
+) -> Result<TcpStream, Socks5Error> {
     // Read request header
     // +----+-----+-------+------+----------+----------+
     // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
@@ -334,8 +357,8 @@ async fn handle_request(stream: &mut TcpStream, config: &ServerConfig) -> Result
 
     // Connect to target
     let target = format!("{}:{}", target_addr, port);
-    let connect_result = if let Some(ref cidr) = config.send_through {
-        let local_ip = random_ip_from_cidr(cidr);
+    let bind_ip = outbound_ip.or_else(|| config.send_through.as_ref().map(random_ip_from_cidr));
+    let connect_result = if let Some(local_ip) = bind_ip {
         info!("Connecting to {} via {}", target, local_ip);
 
         // Resolve target address and try to connect

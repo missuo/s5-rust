@@ -76,6 +76,24 @@ s5-rust -u myuser -p mypassword --send-through 2a06:a005:1c40::/48
 
 This will randomly select an IP from the specified CIDR range for each outbound connection.
 
+#### Pinning a specific outbound IP per connection
+
+When `--send-through` is set, clients can pin a specific source IP for a single connection by appending `@<IP>` to the password. The IP must fall within the configured CIDR; otherwise the suffix is ignored and the whole string is treated as the password (which will fail authentication).
+
+For example, with the server started as:
+
+```bash
+s5-rust -u myuser -p Hello2025 --send-through 2a06:a005:1c40::/44
+```
+
+| Client password | Outbound source IP |
+|-----------------|--------------------|
+| `Hello2025` | Random IP from `2a06:a005:1c40::/44` |
+| `Hello2025@2a06:a005:1c40::1` | `2a06:a005:1c40::1` |
+| `Hello2025@1.2.3.4` (not in CIDR) | Auth fails |
+
+Note: the configured password should not end with `@<IP-within-CIDR>`, since that suffix would be parsed as a pin request.
+
 ## Testing
 
 ### Using curl
