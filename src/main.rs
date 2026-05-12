@@ -1,12 +1,20 @@
 use clap::Parser;
 use ipnet::IpNet;
 use rand::Rng;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::time::timeout;
 use tracing::{error, info, warn};
+
+// Bounded timeouts to prevent fd leaks from slow/stuck clients and targets.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// Sleep after accept() error to avoid busy-looping when fd table is exhausted (EMFILE).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 // SOCKS5 protocol constants
 const SOCKS_VERSION: u8 = 0x05;
@@ -58,6 +66,8 @@ enum Socks5Error {
     UnsupportedAddressType(u8),
     #[error("Connection failed")]
     ConnectionFailed,
+    #[error("Handshake timeout")]
+    HandshakeTimeout,
 }
 
 #[derive(Clone)]
@@ -164,6 +174,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 error!("Failed to accept connection: {}", e);
+                // EMFILE/ENFILE: the listener stays readable so a tight loop would peg a core
+                // while spamming logs. Brief sleep lets the kernel and us recover.
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
             }
         }
     }
@@ -176,24 +189,27 @@ async fn handle_client(
 ) -> Result<(), Socks5Error> {
     info!("New connection from {}", peer_addr);
 
-    // Step 1: Handle greeting and authentication negotiation
-    let auth_method = negotiate_auth(&mut stream).await?;
-
-    let outbound_ip = if auth_method == AUTH_USERNAME_PASSWORD {
-        // Step 2: Perform username/password authentication
-        let ip = authenticate(&mut stream, &config).await?;
-        info!("Client {} authenticated successfully", peer_addr);
-        ip
-    } else {
-        // No acceptable method
-        stream.write_all(&[SOCKS_VERSION, AUTH_NO_ACCEPTABLE]).await?;
-        return Err(Socks5Error::NoAcceptableAuth);
+    // Bound the whole handshake (greeting + auth + CONNECT). A misbehaving client that opens a
+    // socket but never sends bytes would otherwise pin two fds and a task indefinitely.
+    let target_stream = match timeout(HANDSHAKE_TIMEOUT, async {
+        let auth_method = negotiate_auth(&mut stream).await?;
+        let outbound_ip = if auth_method == AUTH_USERNAME_PASSWORD {
+            let ip = authenticate(&mut stream, &config).await?;
+            info!("Client {} authenticated successfully", peer_addr);
+            ip
+        } else {
+            stream.write_all(&[SOCKS_VERSION, AUTH_NO_ACCEPTABLE]).await?;
+            return Err(Socks5Error::NoAcceptableAuth);
+        };
+        handle_request(&mut stream, &config, outbound_ip).await
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Err(Socks5Error::HandshakeTimeout),
     };
 
-    // Step 3: Handle request
-    let target_stream = handle_request(&mut stream, &config, outbound_ip).await?;
-
-    // Step 4: Relay data
+    // Data relay is intentionally not timed — long-lived sessions (SSH, websockets) are valid.
     relay_data(stream, target_stream).await?;
 
     Ok(())
@@ -358,47 +374,42 @@ async fn handle_request(
     // Connect to target
     let target = format!("{}:{}", target_addr, port);
     let bind_ip = outbound_ip.or_else(|| config.send_through.as_ref().map(random_ip_from_cidr));
-    let connect_result = if let Some(local_ip) = bind_ip {
-        info!("Connecting to {} via {}", target, local_ip);
+    let connect_future = async {
+        if let Some(local_ip) = bind_ip {
+            info!("Connecting to {} via {}", target, local_ip);
 
-        // Resolve target address and try to connect
-        match target.to_socket_addrs() {
-            Ok(addrs) => {
-                let mut last_err = None;
-                let mut connected = None;
+            // Async DNS resolution — never block a tokio worker on system DNS.
+            let addrs = tokio::net::lookup_host(&target).await?;
+            let mut last_err: Option<std::io::Error> = None;
+            for addr in addrs {
+                let socket = match local_ip {
+                    IpAddr::V4(_) if addr.is_ipv4() => TcpSocket::new_v4()?,
+                    IpAddr::V6(_) if addr.is_ipv6() => TcpSocket::new_v6()?,
+                    _ => continue,
+                };
 
-                for addr in addrs {
-                    // Create socket matching the local IP family
-                    let socket = match local_ip {
-                        IpAddr::V4(_) if addr.is_ipv4() => TcpSocket::new_v4()?,
-                        IpAddr::V6(_) if addr.is_ipv6() => TcpSocket::new_v6()?,
-                        _ => continue, // Skip if address family doesn't match
-                    };
-
-                    let bind_addr = SocketAddr::new(local_ip, 0);
-                    if socket.bind(bind_addr).is_ok() {
-                        match socket.connect(addr).await {
-                            Ok(stream) => {
-                                connected = Some(stream);
-                                break;
-                            }
-                            Err(e) => last_err = Some(e),
-                        }
+                let bind_addr = SocketAddr::new(local_ip, 0);
+                if socket.bind(bind_addr).is_ok() {
+                    match socket.connect(addr).await {
+                        Ok(stream) => return Ok(stream),
+                        Err(e) => last_err = Some(e),
                     }
                 }
-
-                match connected {
-                    Some(stream) => Ok(stream),
-                    None => Err(last_err.unwrap_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::Other, "No matching address family")
-                    })),
-                }
             }
-            Err(e) => Err(e),
+            Err(last_err.unwrap_or_else(|| {
+                std::io::Error::other("No matching address family")
+            }))
+        } else {
+            info!("Connecting to {}", target);
+            TcpStream::connect(&target).await
         }
-    } else {
-        info!("Connecting to {}", target);
-        TcpStream::connect(&target).await
+    };
+
+    // Bound the connect attempt. Kernel default retries take ~127s — long enough for an
+    // unreachable target to pile up fds and tasks. 10s covers normal RTT + retransmit.
+    let connect_result = match timeout(CONNECT_TIMEOUT, connect_future).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout")),
     };
 
     match connect_result {
@@ -450,28 +461,18 @@ async fn send_reply(
 }
 
 async fn relay_data(mut client: TcpStream, mut target: TcpStream) -> Result<(), Socks5Error> {
-    let (mut client_read, mut client_write) = client.split();
-    let (mut target_read, mut target_write) = target.split();
-
-    let client_to_target = tokio::io::copy(&mut client_read, &mut target_write);
-    let target_to_client = tokio::io::copy(&mut target_read, &mut client_write);
-
-    tokio::select! {
-        result = client_to_target => {
-            if let Err(e) = result {
-                if e.kind() != std::io::ErrorKind::ConnectionReset {
-                    return Err(Socks5Error::Io(e));
-                }
-            }
-        }
-        result = target_to_client => {
-            if let Err(e) = result {
-                if e.kind() != std::io::ErrorKind::ConnectionReset {
-                    return Err(Socks5Error::Io(e));
-                }
-            }
-        }
+    // copy_bidirectional handles half-close correctly: when one side EOFs, it shuts down the
+    // peer's write half and keeps the other direction draining until it also closes. The old
+    // select! pattern raced the two copies and cancelled the slower one, leaking pending data
+    // and (with TCP CLOSE_WAIT) leaking fds.
+    match tokio::io::copy_bidirectional(&mut client, &mut target).await {
+        Ok(_) => Ok(()),
+        Err(e) if matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+        ) => Ok(()),
+        Err(e) => Err(Socks5Error::Io(e)),
     }
-
-    Ok(())
 }
