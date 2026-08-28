@@ -1,6 +1,9 @@
+mod token;
+
 use clap::Parser;
 use ipnet::IpNet;
 use rand::Rng;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,8 +75,18 @@ enum Socks5Error {
 
 #[derive(Clone)]
 struct ServerConfig {
-    username: String,
-    password: String,
+    /// The static login, and None where this server accepts only signed
+    /// credentials.
+    ///
+    /// Optional because the two kinds of client want different things. An
+    /// operator's own forwarder runs on a trusted host and wants one long-lived
+    /// login; an end user is handed a credential that names one address and
+    /// expires. Running a second instance with no static login at all is what
+    /// makes the second case safe to expose: there is then no password on that
+    /// port that could pin anything other than what was signed for.
+    static_login: Option<(String, String)>,
+    /// Verifying keys for signed credentials, by key id. Empty disables them.
+    keys: token::Keyring,
     send_through: Option<IpNet>,
 }
 
@@ -111,13 +124,23 @@ fn random_ip_from_cidr(cidr: &IpNet) -> IpAddr {
 #[command(name = "s5-rust")]
 #[command(about = "A SOCKS5 proxy server with username/password authentication")]
 struct Args {
-    /// Username for authentication
-    #[arg(short, long)]
-    username: String,
+    /// Username for authentication. Omit, with --token-pubkey set, to accept
+    /// signed credentials only.
+    #[arg(short, long, requires = "password")]
+    username: Option<String>,
 
     /// Password for authentication
-    #[arg(short, long)]
-    password: String,
+    #[arg(short, long, requires = "username")]
+    password: Option<String>,
+
+    /// Ed25519 verifying key for signed credentials, as <kid>:<key> where the
+    /// key is 32 bytes in base64url or hex. Repeatable, so a new key can be
+    /// accepted before the old one is withdrawn.
+    ///
+    /// This server never holds a signing key: it checks credentials and cannot
+    /// issue them, so a break-in here yields no ability to pin addresses.
+    #[arg(long = "token-pubkey", value_name = "KID:KEY")]
+    token_pubkey: Vec<String>,
 
     /// Port to listen on
     #[arg(long, default_value = "1080")]
@@ -152,9 +175,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Send through CIDR: {}", cidr);
     }
 
+    let mut keys = HashMap::new();
+    for spec in &args.token_pubkey {
+        let (kid, vk) = token::parse_key(spec).expect("Invalid --token-pubkey");
+        if keys.insert(kid.clone(), vk).is_some() {
+            panic!("--token-pubkey {kid} given twice");
+        }
+        info!("Accepting signed credentials under key id {}", kid);
+    }
+
+    let static_login = match (args.username, args.password) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    };
+
+    // A server that can authenticate nobody would start, listen, and refuse
+    // every connection -- which looks like a network fault from the outside and
+    // takes far longer to diagnose than it should.
+    if static_login.is_none() && keys.is_empty() {
+        panic!("no way to authenticate: pass --username/--password, --token-pubkey, or both");
+    }
+    if static_login.is_none() {
+        info!("Static login disabled; signed credentials only");
+    }
+    if keys.is_empty() {
+        info!("No verifying keys configured; signed credentials disabled");
+    }
+
     let config = Arc::new(ServerConfig {
-        username: args.username,
-        password: args.password,
+        static_login,
+        keys,
         send_through,
     });
 
@@ -283,6 +333,50 @@ async fn authenticate(
     stream.read_exact(&mut password).await?;
     let password = String::from_utf8_lossy(&password).to_string();
 
+    // A signed credential first, because the two are told apart by the username
+    // and there is no point comparing one against the static password.
+    //
+    // The difference between them is what the address means. Under the static
+    // login the address is a *selection* -- whoever holds the password may pin
+    // anything in the pool, including another tenant's -- which is safe for an
+    // operator's own forwarder and cannot be handed to anyone else. A signed
+    // credential is a *grant*: the issuer named one address and one expiry, and
+    // altering either invalidates it rather than changing what it permits.
+    if token::looks_signed(&username) {
+        return match token::verify(
+            &username,
+            &password,
+            &config.keys,
+            config.send_through.as_ref(),
+            token::now_secs(),
+        ) {
+            Ok(grant) => {
+                info!(
+                    "Signed credential accepted: subject={} addr={} expires_in={}s",
+                    grant.subject,
+                    grant.addr,
+                    grant.expires_at.saturating_sub(token::now_secs())
+                );
+                stream.write_all(&[AUTH_PASSWORD_VERSION, 0x00]).await?;
+                Ok(Some(grant.addr))
+            }
+            Err(why) => {
+                // Logged here and never told to the client, which gets the same
+                // failure for all of them. Saying which check failed is telling
+                // a prober where to spend their next attempt.
+                warn!("Signed credential rejected: {:?}", why);
+                stream.write_all(&[AUTH_PASSWORD_VERSION, 0x01]).await?;
+                Err(Socks5Error::AuthFailed)
+            }
+        };
+    }
+
+    let Some((ref want_user, ref want_pass)) = config.static_login else {
+        warn!("Static login attempted but this server accepts signed credentials only");
+        stream.write_all(&[AUTH_PASSWORD_VERSION, 0x01]).await?;
+        return Err(Socks5Error::AuthFailed);
+    };
+
     // Split on the last '@'. If the right side parses as an IP and falls
     // within the configured send_through CIDR, the left side is the base
     // password and the IP is used as the outbound source. Otherwise the
@@ -299,7 +393,7 @@ async fn authenticate(
     };
 
     // Verify credentials
-    if username == config.username && base_password == config.password {
+    if &username == want_user && &base_password == want_pass {
         stream.write_all(&[AUTH_PASSWORD_VERSION, 0x00]).await?;
         Ok(outbound_ip)
     } else {

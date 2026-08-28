@@ -41,11 +41,12 @@ s5-rust --username <USERNAME> --password <PASSWORD> [OPTIONS]
 
 | Option | Short | Description | Default |
 |--------|-------|-------------|---------|
-| `--username` | `-u` | Username for authentication | Required |
-| `--password` | `-p` | Password for authentication | Required |
+| `--username` | `-u` | Username for authentication | Required unless `--token-pubkey` is set |
+| `--password` | `-p` | Password for authentication | Required unless `--token-pubkey` is set |
 | `--port` | | Port to listen on | `1080` |
 | `--bind` | | Address to bind to | `0.0.0.0` |
 | `--send-through` | | CIDR range for outbound source IP | None |
+| `--token-pubkey` | | Ed25519 verifying key for signed credentials, as `<kid>:<key>`. Repeatable. | None |
 | `--help` | `-h` | Print help information | |
 
 ### Examples
@@ -75,6 +76,43 @@ s5-rust -u myuser -p mypassword --send-through 2a06:a005:1c40::/48
 ```
 
 This will randomly select an IP from the specified CIDR range for each outbound connection.
+
+### Signed credentials
+
+The `@<IP>` suffix below is a **selection**, not an **enforcement**: whoever holds the password may pin any address in `--send-through`, including one you meant for somebody else. That is fine for your own client on a machine you control, and it is not something you can hand to a third party.
+
+A signed credential is the grant itself. An issuer names one address and one expiry, signs them, and this server does nothing but check the signature — so the holder gets exactly the address they were given, until it expires, and editing either field invalidates the credential rather than changing what it permits.
+
+Signing is asymmetric on purpose. This server holds only a **verifying** key: it can check credentials and cannot issue them, so a break-in here yields no ability to pin addresses. The signing key never leaves the issuer.
+
+```bash
+# Accepts signed credentials only — no static password on this port at all.
+s5-rust --port 2334 --send-through 2a06:a005:1c40::/44 \
+        --token-pubkey k1:ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c
+
+# Or both, so one port serves your own client and issued credentials alike.
+s5-rust -u myuser -p mypassword --send-through 2a06:a005:1c40::/44 \
+        --token-pubkey k1:<hex-or-base64url-public-key>
+```
+
+`--token-pubkey` is repeatable, which is how a key is rotated: start issuing under a new id while this server still accepts the old, then withdraw the old. Withdrawing an id invalidates every credential issued under it at once — the only revocation there is, and the one an incident wants.
+
+#### Credential format
+
+```text
+username: hk1.<kid>.<subject>.<expiry-unix>.<address-hex>
+password: <base64url(ed25519 signature over the username)>
+```
+
+The claim travels in the username so a log line says which subject, which address, and until when. Neither field contains `:` or `@`, so a credential drops straight into a proxy URL:
+
+```bash
+curl --proxy "socks5h://hk1.k1.sbx_abc.1756400000.2602f7ee00fa00000000000000000001:<sig>@proxy:2334" https://example.com
+```
+
+The address is 8 hex digits for IPv4 and 32 for IPv6 — written normally, an IPv6 address would put colons in the userinfo and make that URL ambiguous.
+
+A credential is refused if the signature does not verify, the key id is unknown, the expiry has passed (with 60 seconds of clock-skew grace), or the address falls outside `--send-through`. The client is told only that authentication failed; which check failed is logged here and not disclosed.
 
 #### Pinning a specific outbound IP per connection
 

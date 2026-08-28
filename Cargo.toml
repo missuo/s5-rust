@@ -12,3 +12,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ipnet = "2"
 rand = "0.8"
+# Signed credentials. Ed25519 rather than an HMAC so this server holds only a
+# verifying key: it is the machine on the public internet, and a break-in here
+# must not yield the ability to mint credentials for the whole pool.
+ed25519-dalek = "2"
+base64 = "0.22"
+hex = "0.4"
