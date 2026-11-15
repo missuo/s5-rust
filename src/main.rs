@@ -1,14 +1,17 @@
+mod tls;
 mod token;
+mod udp;
 
 use clap::Parser;
 use ipnet::IpNet;
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
@@ -33,7 +36,7 @@ const AUTH_PASSWORD_VERSION: u8 = 0x01;
 // Commands
 const CMD_CONNECT: u8 = 0x01;
 // const CMD_BIND: u8 = 0x02;
-// const CMD_UDP_ASSOCIATE: u8 = 0x03;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 
 // Address types
 const ATYP_IPV4: u8 = 0x01;
@@ -71,6 +74,8 @@ enum Socks5Error {
     ConnectionFailed,
     #[error("Handshake timeout")]
     HandshakeTimeout,
+    #[error("Plain SOCKS5 refused (--tls-only)")]
+    PlainRefused,
 }
 
 #[derive(Clone)]
@@ -88,6 +93,8 @@ struct ServerConfig {
     /// Verifying keys for signed credentials, by key id. Empty disables them.
     keys: token::Keyring,
     send_through: Option<IpNet>,
+    /// UDP ASSOCIATE settings; None answers it with "command not supported".
+    udp: Option<udp::UdpSettings>,
 }
 
 fn random_ip_from_cidr(cidr: &IpNet) -> IpAddr {
@@ -153,19 +160,97 @@ struct Args {
     /// CIDR range for outbound source IP (e.g., 2a06:a005:1c40::/44)
     #[arg(long)]
     send_through: Option<String>,
+
+    /// Enable UDP ASSOCIATE (SOCKS5 UDP relay).
+    #[arg(long)]
+    udp: bool,
+
+    /// Address to put in UDP ASSOCIATE replies. By default a public local
+    /// address is sent as is and a private one (behind NAT) as 0.0.0.0, which
+    /// direct clients read as "the server's address". Behind NAT, set this to
+    /// the public IP for clients that chain through another proxy (Surge's
+    /// underlying-proxy), which pass 0.0.0.0 on literally.
+    #[arg(long, value_name = "IP", requires = "udp")]
+    udp_advertise: Option<IpAddr>,
+
+    /// Restrict the per-association UDP ports to START-END, for firewalls.
+    /// Each active association holds one port.
+    #[arg(long, value_name = "START-END", requires = "udp", value_parser = udp::parse_port_range)]
+    udp_ports: Option<std::ops::RangeInclusive<u16>>,
+
+    /// Accept a UDP association's first datagram from any address instead of
+    /// only from the control connection's. Needed when the client's UDP leaves
+    /// from a different address than its TCP -- through a proxy chain (Surge
+    /// underlying-proxy), dual WAN, or TCP over IPv6 with UDP over IPv4.
+    #[arg(long, requires = "udp")]
+    udp_any_source: bool,
+
+    /// Close a UDP association after this many seconds without traffic.
+    #[arg(long, value_name = "SECS", default_value = "300", requires = "udp")]
+    udp_timeout: u64,
+
+    /// PEM certificate (chain) for SOCKS5 over TLS. If neither this nor
+    /// --tls-key exists yet, a self-signed pair is generated at these paths.
+    #[arg(long, value_name = "PATH", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key for SOCKS5 over TLS.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// Refuse plain SOCKS5 on this port; TLS clients only. Without it a port
+    /// with TLS configured serves both, told apart by the first byte.
+    #[arg(long, requires = "tls_cert")]
+    tls_only: bool,
+
+    /// Print the SHA-256 fingerprint of the TLS certificate (generating it if
+    /// needed) and exit.
+    #[arg(long, requires = "tls_cert")]
+    print_fingerprint: bool,
+}
+
+/// The first byte of a TLS ClientHello record (content type "handshake").
+const TLS_HANDSHAKE: u8 = 0x16;
+
+/// How the listener treats a new connection.
+struct Listener {
+    tls: Option<Arc<tls::Tls>>,
+    tls_only: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
+    let args = Args::parse();
+
+    // Answered before logging starts: the output is meant for scripts, and
+    // log lines on the same stdout would corrupt it.
+    if args.print_fingerprint {
+        if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+            let (_, fingerprint) = tls::Tls::load_or_generate(cert, key)
+                .map_err(|e| format!("TLS setup failed: {e}"))?;
+            println!("{fingerprint}");
+        }
+        return Ok(());
+    }
+
+    // Initialize logging. RUST_LOG when set, info otherwise -- the default is
+    // not added on top of RUST_LOG, where it would override RUST_LOG=debug.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
-    let args = Args::parse();
+    let tls = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => {
+            let (tls, fingerprint) = tls::Tls::load_or_generate(cert, key)
+                .map_err(|e| format!("TLS setup failed: {e}"))?;
+            info!("TLS certificate SHA-256 fingerprint: {}", fingerprint);
+            Some(tls)
+        }
+        _ => None,
+    };
 
     let send_through = args.send_through.map(|s| {
         s.parse::<IpNet>().expect("Invalid CIDR format for --send-through")
@@ -202,22 +287,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("No verifying keys configured; signed credentials disabled");
     }
 
+    let udp = args.udp.then(|| udp::UdpSettings {
+        advertise: args.udp_advertise,
+        ports: args.udp_ports.clone(),
+        idle_timeout: Duration::from_secs(args.udp_timeout.max(1)),
+        any_source: args.udp_any_source,
+    });
+    if let Some(ref u) = udp {
+        info!(
+            "UDP ASSOCIATE enabled (advertise {}, ports {}, idle {}s, source {})",
+            u.advertise.map_or("auto".to_string(), |ip| ip.to_string()),
+            u.ports
+                .as_ref()
+                .map_or("any".to_string(), |r| format!("{}-{}", r.start(), r.end())),
+            u.idle_timeout.as_secs(),
+            if u.any_source {
+                "any"
+            } else {
+                "control connection's"
+            }
+        );
+    }
+
     let config = Arc::new(ServerConfig {
         static_login,
         keys,
         send_through,
+        udp,
+    });
+
+    #[cfg(unix)]
+    if let Some(ref tls) = tls {
+        let tls = Arc::clone(tls);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let Ok(mut hup) = signal(SignalKind::hangup()) else {
+                warn!("Cannot listen for SIGHUP; TLS reload disabled");
+                return;
+            };
+            while hup.recv().await.is_some() {
+                match tls.reload() {
+                    Ok(fp) => info!("TLS certificate reloaded, SHA-256 fingerprint: {}", fp),
+                    Err(e) => error!("TLS reload failed, keeping the old certificate: {}", e),
+                }
+            }
+        });
+    }
+
+    let listener_mode = Arc::new(Listener {
+        tls,
+        tls_only: args.tls_only,
     });
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = TcpListener::bind(&addr).await?;
-    info!("SOCKS5 server listening on {}", addr);
+    info!(
+        "SOCKS5 server listening on {}{}",
+        // The bound address rather than the configured one, so --port 0
+        // reports the port the kernel picked.
+        listener.local_addr()?,
+        match (&listener_mode.tls, listener_mode.tls_only) {
+            (None, _) => "",
+            (Some(_), false) => " (plain and TLS)",
+            (Some(_), true) => " (TLS only)",
+        }
+    );
 
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 let config = Arc::clone(&config);
+                let mode = Arc::clone(&listener_mode);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, peer_addr, config).await {
+                    if let Err(e) = accept(stream, peer_addr, config, mode).await {
                         warn!("Error handling client {}: {}", peer_addr, e);
                     }
                 });
@@ -232,26 +374,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn handle_client(
-    mut stream: TcpStream,
+/// Decides between plain SOCKS5 and TLS for a fresh connection, then hands
+/// the stream to the SOCKS5 handler.
+async fn accept(
+    stream: TcpStream,
     peer_addr: SocketAddr,
     config: Arc<ServerConfig>,
+    mode: Arc<Listener>,
 ) -> Result<(), Socks5Error> {
+    // The address the client reached us on; UDP associations bind here so
+    // their replies leave from the address the client is talking to.
+    let local_ip = stream.local_addr()?.ip();
+
+    let Some(ref tls) = mode.tls else {
+        return handle_client(stream, peer_addr, local_ip, config).await;
+    };
+
+    // A ClientHello always starts with 0x16 and a SOCKS5 greeting with 0x05,
+    // so one peeked byte tells them apart without consuming anything. The
+    // peek is covered by the handshake timeout like everything else before
+    // authentication.
+    let mut first = [0u8; 1];
+    let n = match timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(Socks5Error::HandshakeTimeout),
+    };
+    if n == 0 {
+        return Ok(());
+    }
+    match first[0] {
+        TLS_HANDSHAKE => {
+            let acceptor = tls.acceptor();
+            let tls_stream = match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(r) => r?,
+                Err(_) => return Err(Socks5Error::HandshakeTimeout),
+            };
+            handle_client(tls_stream, peer_addr, local_ip, config).await
+        }
+        SOCKS_VERSION if !mode.tls_only => handle_client(stream, peer_addr, local_ip, config).await,
+        SOCKS_VERSION => Err(Socks5Error::PlainRefused),
+        other => Err(Socks5Error::InvalidVersion(other)),
+    }
+}
+
+/// What an authenticated request turned into.
+enum Session {
+    Connect(TcpStream),
+    Udp(udp::Association),
+}
+
+async fn handle_client<S>(
+    mut stream: S,
+    peer_addr: SocketAddr,
+    local_ip: IpAddr,
+    config: Arc<ServerConfig>,
+) -> Result<(), Socks5Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     info!("New connection from {}", peer_addr);
 
-    // Bound the whole handshake (greeting + auth + CONNECT). A misbehaving client that opens a
+    // Bound the whole handshake (greeting + auth + request). A misbehaving client that opens a
     // socket but never sends bytes would otherwise pin two fds and a task indefinitely.
-    let target_stream = match timeout(HANDSHAKE_TIMEOUT, async {
+    let session = match timeout(HANDSHAKE_TIMEOUT, async {
         let auth_method = negotiate_auth(&mut stream).await?;
         let outbound_ip = if auth_method == AUTH_USERNAME_PASSWORD {
             let ip = authenticate(&mut stream, &config).await?;
             info!("Client {} authenticated successfully", peer_addr);
             ip
         } else {
-            stream.write_all(&[SOCKS_VERSION, AUTH_NO_ACCEPTABLE]).await?;
+            // negotiate_auth already sent the 0xFF refusal.
             return Err(Socks5Error::NoAcceptableAuth);
         };
-        handle_request(&mut stream, &config, outbound_ip).await
+        handle_request(&mut stream, &config, outbound_ip, peer_addr, local_ip).await
     })
     .await
     {
@@ -259,13 +454,19 @@ async fn handle_client(
         Err(_) => return Err(Socks5Error::HandshakeTimeout),
     };
 
-    // Data relay is intentionally not timed — long-lived sessions (SSH, websockets) are valid.
-    relay_data(stream, target_stream).await?;
+    // Relays are intentionally not under the handshake timeout — long-lived
+    // sessions (SSH, websockets, QUIC) are valid.
+    match session {
+        Session::Connect(target) => relay_data(stream, target).await?,
+        Session::Udp(assoc) => assoc.run(&mut stream).await?,
+    }
 
     Ok(())
 }
 
-async fn negotiate_auth(stream: &mut TcpStream) -> Result<u8, Socks5Error> {
+async fn negotiate_auth<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<u8, Socks5Error> {
     // Read greeting
     let mut buf = [0u8; 2];
     stream.read_exact(&mut buf).await?;
@@ -293,12 +494,23 @@ async fn negotiate_auth(stream: &mut TcpStream) -> Result<u8, Socks5Error> {
 
     // Send method selection
     stream.write_all(&[SOCKS_VERSION, selected_method]).await?;
+    stream.flush().await?;
 
     Ok(selected_method)
 }
 
-async fn authenticate(
-    stream: &mut TcpStream,
+async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    config: &ServerConfig,
+) -> Result<Option<IpAddr>, Socks5Error> {
+    let result = authenticate_inner(stream, config).await;
+    // TLS buffers writes; the status byte must reach the client either way.
+    stream.flush().await?;
+    result
+}
+
+async fn authenticate_inner<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     config: &ServerConfig,
 ) -> Result<Option<IpAddr>, Socks5Error> {
     // Read authentication request
@@ -402,11 +614,13 @@ async fn authenticate(
     }
 }
 
-async fn handle_request(
-    stream: &mut TcpStream,
+async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     config: &ServerConfig,
     outbound_ip: Option<IpAddr>,
-) -> Result<TcpStream, Socks5Error> {
+    peer_addr: SocketAddr,
+    local_ip: IpAddr,
+) -> Result<Session, Socks5Error> {
     // Read request header
     // +----+-----+-------+------+----------+----------+
     // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
@@ -426,11 +640,14 @@ async fn handle_request(
         return Err(Socks5Error::InvalidVersion(version));
     }
 
-    // Only support CONNECT command
-    if cmd != CMD_CONNECT {
-        send_reply(stream, REPLY_COMMAND_NOT_SUPPORTED, None).await?;
-        return Err(Socks5Error::UnsupportedCommand(cmd));
-    }
+    let udp_settings = match cmd {
+        CMD_CONNECT => None,
+        CMD_UDP_ASSOCIATE if config.udp.is_some() => config.udp.as_ref(),
+        _ => {
+            send_reply(stream, REPLY_COMMAND_NOT_SUPPORTED, None).await?;
+            return Err(Socks5Error::UnsupportedCommand(cmd));
+        }
+    };
 
     // Parse destination address
     let target_addr = match atyp {
@@ -464,6 +681,41 @@ async fn handle_request(
     let mut port_buf = [0u8; 2];
     stream.read_exact(&mut port_buf).await?;
     let port = u16::from_be_bytes(port_buf);
+
+    if let Some(settings) = udp_settings {
+        // For UDP ASSOCIATE the address names where the client will send
+        // from, not a destination. A domain there is meaningless; treat it as
+        // "unknown", which the RFC already allows for with zeros.
+        let requested = target_addr
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, port));
+        // Choose the outbound address once for the whole association, like
+        // a TCP connection does once per connection.
+        let outbound =
+            outbound_ip.or_else(|| config.send_through.as_ref().map(random_ip_from_cidr));
+        let opened =
+            udp::Association::bind(local_ip, peer_addr, requested, outbound, settings).await;
+        let assoc = match opened {
+            Ok(a) => a,
+            Err(e) => {
+                error!("Cannot open UDP association for {}: {}", peer_addr, e);
+                send_reply(stream, REPLY_GENERAL_FAILURE, None).await?;
+                return Err(Socks5Error::Io(e));
+            }
+        };
+        let bound = assoc.local_addr()?;
+        let reply_to = udp::reply_address(bound, settings);
+        info!(
+            "UDP association for {} on {} (reply {}){}",
+            peer_addr,
+            bound,
+            reply_to,
+            outbound.map_or(String::new(), |ip| format!(" via {}", ip))
+        );
+        send_reply(stream, REPLY_SUCCEEDED, Some(reply_to)).await?;
+        return Ok(Session::Udp(assoc));
+    }
 
     // Connect to target
     let target = format!("{}:{}", target_addr, port);
@@ -510,7 +762,7 @@ async fn handle_request(
         Ok(target_stream) => {
             let local_addr = target_stream.local_addr().ok();
             send_reply(stream, REPLY_SUCCEEDED, local_addr).await?;
-            Ok(target_stream)
+            Ok(Session::Connect(target_stream))
         }
         Err(e) => {
             let reply = match e.kind() {
@@ -524,8 +776,8 @@ async fn handle_request(
     }
 }
 
-async fn send_reply(
-    stream: &mut TcpStream,
+async fn send_reply<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     reply: u8,
     bind_addr: Option<SocketAddr>,
 ) -> Result<(), Socks5Error> {
@@ -551,10 +803,14 @@ async fn send_reply(
     }
 
     stream.write_all(&response).await?;
+    stream.flush().await?;
     Ok(())
 }
 
-async fn relay_data(mut client: TcpStream, mut target: TcpStream) -> Result<(), Socks5Error> {
+async fn relay_data<S: AsyncRead + AsyncWrite + Unpin>(
+    mut client: S,
+    mut target: TcpStream,
+) -> Result<(), Socks5Error> {
     // copy_bidirectional handles half-close correctly: when one side EOFs, it shuts down the
     // peer's write half and keeps the other direction draining until it also closes. The old
     // select! pattern raced the two copies and cancelled the slower one, leaking pending data

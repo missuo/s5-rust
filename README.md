@@ -7,6 +7,8 @@ A lightweight SOCKS5 proxy server written in Rust with username/password authent
 - SOCKS5 protocol implementation (RFC 1928)
 - Username/password authentication (RFC 1929)
 - CONNECT command support for TCP proxying
+- UDP ASSOCIATE for UDP relay (opt-in, `--udp`)
+- SOCKS5 over TLS (Surge `socks5-tls`), with a self-signed certificate generated on first start
 - IPv4, IPv6, and domain name addressing
 - Async I/O with Tokio for high performance
 - Configurable bind address and port
@@ -47,6 +49,15 @@ s5-rust --username <USERNAME> --password <PASSWORD> [OPTIONS]
 | `--bind` | | Address to bind to | `0.0.0.0` |
 | `--send-through` | | CIDR range for outbound source IP | None |
 | `--token-pubkey` | | Ed25519 verifying key for signed credentials, as `<kid>:<key>`. Repeatable. | None |
+| `--udp` | | Enable UDP ASSOCIATE | Off |
+| `--udp-advertise` | | Address sent in UDP ASSOCIATE replies | Auto |
+| `--udp-any-source` | | Accept a UDP association's datagrams from any address, not only the control connection's | Off |
+| `--udp-ports` | | Port range for UDP associations, `START-END` | Any |
+| `--udp-timeout` | | Close an idle UDP association after this many seconds | `300` |
+| `--tls-cert` | | PEM certificate for SOCKS5 over TLS; generated if absent | None |
+| `--tls-key` | | PEM private key for SOCKS5 over TLS; generated if absent | None |
+| `--tls-only` | | Refuse plain SOCKS5 on a TLS port | Off |
+| `--print-fingerprint` | | Print the TLS certificate's SHA-256 fingerprint and exit | |
 | `--help` | `-h` | Print help information | |
 
 ### Examples
@@ -76,6 +87,45 @@ s5-rust -u myuser -p mypassword --send-through 2a06:a005:1c40::/48
 ```
 
 This will randomly select an IP from the specified CIDR range for each outbound connection.
+
+### UDP relay
+
+`--udp` enables UDP ASSOCIATE. Each association gets its own UDP socket, opened when the client asks and closed when its TCP connection closes or after `--udp-timeout` seconds without traffic. Datagrams are relayed with endpoint-independent mapping and filtering (full cone), which is what QUIC, STUN and games expect.
+
+```bash
+s5-rust -u myuser -p mypassword --udp
+```
+
+What the reply tells the client to send to:
+
+- A public address on this machine is sent as is.
+- Behind NAT (the public IP is not on this machine), `0.0.0.0` is sent, which a direct client reads as "the server's address". A client that reaches the server **through another proxy** (Surge's `underlying-proxy`) passes `0.0.0.0` on literally, so there set `--udp-advertise <public IP>`.
+
+By default only datagrams from the address of the client's TCP connection are accepted, so nobody else can use an open association. When TCP and UDP leave the client from different addresses -- through a relay chain, a dual-WAN router, or TCP over IPv6 with UDP over IPv4 -- add `--udp-any-source`: the association then belongs to whichever address sends the first valid datagram. The server logs a warning naming the flag when it drops UDP for this reason.
+
+Each active association holds a port; `--udp-ports 40000-40999` keeps them in a range a firewall can allow.
+
+The datagrams themselves are never encrypted, even with TLS: that is how SOCKS5 UDP is defined.
+
+### SOCKS5 over TLS
+
+Give a certificate and key, or two paths that do not exist yet to have a self-signed pair generated there on first start:
+
+```bash
+s5-rust -u myuser -p mypassword --udp \
+        --tls-cert /etc/s5-rust/tls/cert.pem --tls-key /etc/s5-rust/tls/key.pem
+s5-rust --tls-cert /etc/s5-rust/tls/cert.pem --tls-key /etc/s5-rust/tls/key.pem --print-fingerprint
+```
+
+The port then accepts both TLS and plain SOCKS5, told apart by the first byte; `--tls-only` refuses plain clients. `SIGHUP` (`systemctl reload s5-rust`) reloads the certificate, e.g. after a renewal; if the new files are broken, the old certificate stays in use.
+
+A self-signed certificate is trusted by pinning its fingerprint:
+
+```ini
+[Proxy]
+Plain = socks5, 203.0.113.10, 1080, myuser, mypassword, udp-relay=true
+TLS = socks5-tls, 203.0.113.10, 1080, myuser, mypassword, udp-relay=true, server-cert-fingerprint-sha256=<fingerprint>
+```
 
 ### Signed credentials
 
@@ -134,6 +184,8 @@ Note: the configured password should not end with `@<IP-within-CIDR>`, since tha
 
 ## Testing
 
+`cargo test` runs unit tests and end-to-end tests that start the real binary and talk to it over loopback: TCP, UDP (both directions, IPv4/IPv6/domain targets, fragments and garbage, source checks, port ranges, idle and close handling, socket leaks under concurrency) and TLS (pinning, plain/TLS on one port, reload). Two source-address tests need `127.0.0.2`, which Linux has and macOS skips. To run the end-to-end tests against a binary built elsewhere, set `S5_RUST_BIN`.
+
 ### Using curl
 
 ```bash
@@ -170,7 +222,7 @@ Configure your browser to use SOCKS5 proxy:
 
 ## Environment Variables
 
-Enable debug logging:
+Enable debug logging (dropped UDP datagrams and their reasons are logged at debug):
 
 ```bash
 RUST_LOG=debug s5-rust -u myuser -p mypassword

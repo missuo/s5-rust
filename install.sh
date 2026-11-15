@@ -17,6 +17,8 @@ INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="s5-rust"
 CONFIG_DIR="/etc/s5-rust"
 CONFIG_FILE="${CONFIG_DIR}/config"
+TLS_CERT="${CONFIG_DIR}/tls/cert.pem"
+TLS_KEY="${CONFIG_DIR}/tls/key.pem"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -118,15 +120,23 @@ download_binary() {
     echo -e "${GREEN}Binary installed to ${INSTALL_DIR}/${BINARY_NAME}${NC}"
 }
 
+# Builds the service from the INPUT_* values set by install().
 create_service() {
-    local username=$1
-    local password=$2
-    local port=$3
-    local send_through=$4
-
-    local exec_cmd="${INSTALL_DIR}/${BINARY_NAME} -u ${username} -p ${password} --port ${port}"
-    if [[ -n "$send_through" ]]; then
-        exec_cmd="${exec_cmd} --send-through ${send_through}"
+    local exec_cmd="${INSTALL_DIR}/${BINARY_NAME} -u ${INPUT_USERNAME} -p ${INPUT_PASSWORD} --port ${INPUT_PORT}"
+    if [[ -n "$INPUT_SEND_THROUGH" ]]; then
+        exec_cmd="${exec_cmd} --send-through ${INPUT_SEND_THROUGH}"
+    fi
+    if [[ "$INPUT_UDP" == "yes" ]]; then
+        exec_cmd="${exec_cmd} --udp"
+        if [[ -n "$INPUT_UDP_ADVERTISE" ]]; then
+            exec_cmd="${exec_cmd} --udp-advertise ${INPUT_UDP_ADVERTISE}"
+        fi
+        if [[ "$INPUT_UDP_ANY_SOURCE" == "yes" ]]; then
+            exec_cmd="${exec_cmd} --udp-any-source"
+        fi
+    fi
+    if [[ "$INPUT_TLS" == "yes" ]]; then
+        exec_cmd="${exec_cmd} --tls-cert ${TLS_CERT} --tls-key ${TLS_KEY}"
     fi
 
     cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
@@ -137,6 +147,8 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=${exec_cmd}
+# Re-reads the TLS certificate and key, e.g. after a renewal.
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
 
@@ -149,19 +161,28 @@ EOF
 }
 
 save_config() {
-    local username=$1
-    local password=$2
-    local port=$3
-    local send_through=$4
-
     mkdir -p "${CONFIG_DIR}"
     cat > "${CONFIG_FILE}" << EOF
-USERNAME=${username}
-PASSWORD=${password}
-PORT=${port}
-SEND_THROUGH=${send_through}
+USERNAME=${INPUT_USERNAME}
+PASSWORD=${INPUT_PASSWORD}
+PORT=${INPUT_PORT}
+SEND_THROUGH=${INPUT_SEND_THROUGH}
+UDP=${INPUT_UDP}
+UDP_ADVERTISE=${INPUT_UDP_ADVERTISE}
+UDP_ANY_SOURCE=${INPUT_UDP_ANY_SOURCE}
+TLS=${INPUT_TLS}
 EOF
     chmod 600 "${CONFIG_FILE}"
+}
+
+ask_yes_no() {
+    local prompt=$1 answer
+    read -p "${prompt} [y/N]: " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then echo yes; else echo no; fi
+}
+
+tls_fingerprint() {
+    "${INSTALL_DIR}/${BINARY_NAME}" --tls-cert "${TLS_CERT}" --tls-key "${TLS_KEY}" --print-fingerprint
 }
 
 load_config() {
@@ -192,30 +213,51 @@ install() {
     echo ""
 
     # Get username
-    read -p "Enter username (press Enter for random): " input_username
-    if [[ -z "$input_username" ]]; then
-        input_username=$(generate_random_string 8)
-        echo -e "${YELLOW}Generated username: ${input_username}${NC}"
+    read -p "Enter username (press Enter for random): " INPUT_USERNAME
+    if [[ -z "$INPUT_USERNAME" ]]; then
+        INPUT_USERNAME=$(generate_random_string 8)
+        echo -e "${YELLOW}Generated username: ${INPUT_USERNAME}${NC}"
     fi
 
     # Get password
-    read -p "Enter password (press Enter for random): " input_password
-    if [[ -z "$input_password" ]]; then
-        input_password=$(generate_random_string 16)
-        echo -e "${YELLOW}Generated password: ${input_password}${NC}"
+    read -p "Enter password (press Enter for random): " INPUT_PASSWORD
+    if [[ -z "$INPUT_PASSWORD" ]]; then
+        INPUT_PASSWORD=$(generate_random_string 16)
+        echo -e "${YELLOW}Generated password: ${INPUT_PASSWORD}${NC}"
     fi
 
     # Get port
-    read -p "Enter port (press Enter for default 1080): " input_port
-    if [[ -z "$input_port" ]]; then
-        input_port=1080
+    read -p "Enter port (press Enter for default 1080): " INPUT_PORT
+    if [[ -z "$INPUT_PORT" ]]; then
+        INPUT_PORT=1080
     fi
 
     # Get send-through CIDR (optional)
     echo ""
     echo -e "${YELLOW}Send-through allows you to specify an outbound IP range (CIDR).${NC}"
     echo -e "${YELLOW}Example: 2a06:a005:1c40::/44 or 192.168.1.0/24${NC}"
-    read -p "Enter send-through CIDR (press Enter to skip): " input_send_through
+    read -p "Enter send-through CIDR (press Enter to skip): " INPUT_SEND_THROUGH
+
+    # UDP relay (optional)
+    echo ""
+    echo -e "${YELLOW}UDP relay (UDP ASSOCIATE) uses one extra UDP port per active session.${NC}"
+    INPUT_UDP=$(ask_yes_no "Enable UDP relay?")
+    INPUT_UDP_ADVERTISE=""
+    INPUT_UDP_ANY_SOURCE="no"
+    if [[ "$INPUT_UDP" == "yes" ]]; then
+        echo -e "${YELLOW}Behind NAT (the public IP is not on this machine), enter the public IP:${NC}"
+        echo -e "${YELLOW}clients that chain through another proxy need it.${NC}"
+        read -p "Public IP to advertise (press Enter for auto): " INPUT_UDP_ADVERTISE
+        echo -e "${YELLOW}Clients reaching this server through a relay may send UDP from a${NC}"
+        echo -e "${YELLOW}different address than TCP (e.g. Surge with underlying-proxy).${NC}"
+        INPUT_UDP_ANY_SOURCE=$(ask_yes_no "Accept UDP from any source address?")
+    fi
+
+    # TLS (optional)
+    echo ""
+    echo -e "${YELLOW}TLS serves SOCKS5 over TLS (Surge socks5-tls) on the same port.${NC}"
+    echo -e "${YELLOW}A self-signed certificate is created; clients pin its fingerprint.${NC}"
+    INPUT_TLS=$(ask_yes_no "Enable TLS?")
 
     echo ""
 
@@ -223,10 +265,10 @@ install() {
     download_binary "$version"
 
     # Save config
-    save_config "$input_username" "$input_password" "$input_port" "$input_send_through"
+    save_config
 
     # Create systemd service
-    create_service "$input_username" "$input_password" "$input_port" "$input_send_through"
+    create_service
 
     # Start service
     systemctl start ${SERVICE_NAME}
@@ -237,15 +279,31 @@ install() {
     echo -e "${GREEN}Installation completed successfully!${NC}"
     echo -e "${GREEN}════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  Server:       0.0.0.0:${input_port}"
-    echo -e "  Username:     ${input_username}"
-    echo -e "  Password:     ${input_password}"
-    if [[ -n "$input_send_through" ]]; then
-        echo -e "  Send-through: ${input_send_through}"
+    echo -e "  Server:       0.0.0.0:${INPUT_PORT}"
+    echo -e "  Username:     ${INPUT_USERNAME}"
+    echo -e "  Password:     ${INPUT_PASSWORD}"
+    if [[ -n "$INPUT_SEND_THROUGH" ]]; then
+        echo -e "  Send-through: ${INPUT_SEND_THROUGH}"
+    fi
+    echo -e "  UDP:          ${INPUT_UDP}"
+    echo -e "  TLS:          ${INPUT_TLS}"
+    local surge_type="socks5" surge_extra=""
+    if [[ "$INPUT_UDP" == "yes" ]]; then
+        surge_extra="${surge_extra}, udp-relay=true"
+    fi
+    if [[ "$INPUT_TLS" == "yes" ]]; then
+        local fp
+        fp=$(tls_fingerprint)
+        echo -e "  Fingerprint:  ${fp}"
+        surge_type="socks5-tls"
+        surge_extra="${surge_extra}, server-cert-fingerprint-sha256=${fp}"
     fi
     echo ""
+    echo -e "  Surge:"
+    echo -e "  Proxy = ${surge_type}, <server-ip>, ${INPUT_PORT}, ${INPUT_USERNAME}, ${INPUT_PASSWORD}${surge_extra}"
+    echo ""
     echo -e "  Test command:"
-    echo -e "  curl --socks5 127.0.0.1:${input_port} --proxy-user ${input_username}:${input_password} http://httpbin.org/ip"
+    echo -e "  curl --socks5 127.0.0.1:${INPUT_PORT} --proxy-user ${INPUT_USERNAME}:${INPUT_PASSWORD} http://httpbin.org/ip"
     echo ""
 }
 
@@ -380,6 +438,18 @@ show_status() {
         echo -e "  Password:    ${PASSWORD}"
         if [[ -n "$SEND_THROUGH" ]]; then
             echo -e "  Send-through: ${SEND_THROUGH}"
+        fi
+        local udp_line="${UDP:-no}"
+        if [[ "$UDP" == "yes" && -n "$UDP_ADVERTISE" ]]; then
+            udp_line="${udp_line}, advertise ${UDP_ADVERTISE}"
+        fi
+        if [[ "$UDP" == "yes" && "$UDP_ANY_SOURCE" == "yes" ]]; then
+            udp_line="${udp_line}, any source"
+        fi
+        echo -e "  UDP:         ${udp_line}"
+        echo -e "  TLS:         ${TLS:-no}"
+        if [[ "$TLS" == "yes" && -f "${TLS_CERT}" ]]; then
+            echo -e "  Fingerprint: $(tls_fingerprint)"
         fi
     fi
 }

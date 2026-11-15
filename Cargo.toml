@@ -18,3 +18,10 @@ rand = "0.8"
 ed25519-dalek = "2"
 base64 = "0.22"
 hex = "0.4"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rcgen = "0.14.10"
+ring = "0.17.14"
+
+[dev-dependencies]
+tempfile = "3.27.0"
