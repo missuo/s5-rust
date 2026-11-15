@@ -270,6 +270,12 @@ install() {
     # Create systemd service
     create_service
 
+    # Create the TLS pair now, before the service starts: if both made it at
+    # once, one could see the half the other had written and fail.
+    if [[ "$INPUT_TLS" == "yes" ]]; then
+        tls_fingerprint > /dev/null
+    fi
+
     # Start service
     systemctl start ${SERVICE_NAME}
     systemctl enable ${SERVICE_NAME}
